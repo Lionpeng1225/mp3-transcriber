@@ -316,12 +316,12 @@ class TranscriptionJob:
                     # clustering instead of assigning identities to isolated words.
                     if (self.speaker_run_mode == "during" and self.status not in TERMINAL
                             and self.resume_offset <= self.rows[begin][0]
-                            and self.rows[target - 1][1] - self.rows[begin][0] < 120):
+                            and self.rows[target - 1][1] - self.rows[begin][0] < 30):
                         self.speaker_status = "waiting"
                         self.speaker_phase = "等待目前轉錄分段完成後分析說話者"
                         self.condition.wait(timeout=1)
                         continue
-                    limit = self.rows[begin][0] + 120
+                    limit = self.rows[begin][0] + 30
                     finish = begin + 1
                     while finish < target and self.rows[finish][1] <= limit:
                         finish += 1

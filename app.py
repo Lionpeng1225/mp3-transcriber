@@ -214,7 +214,7 @@ def job_panel():
     st.caption(f"設定時機：{timing_options.get(state.get('speaker_timing', 'manual'), '手動辨識')}。權杖使用上方共用設定。")
     if not importlib.util.find_spec("pyannote"):
         st.caption("首次使用前，請在程式資料夾執行：.venv\\Scripts\\python.exe -m pip install -r requirements-speakers.txt")
-    st.caption(f"說話者進度：已處理 {state.get('speaker_done', 0)}／{len(state['rows'])} 個文字片段。")
+    st.caption(f"說話者進度：已處理 {state.get('speaker_done', 0)}／{len(state['rows'])} 個文字片段；每完成約 30 秒就更新一次逐字稿。")
     st.caption("每次從上次完成的位置接續；手動辨識只處理按下按鈕時的已轉錄範圍。同步模式會在模型檢查點隨轉錄暫停／繼續，模型載入與單次運算不能立即中斷。")
     st.caption("標籤包含所屬音訊區段；不同區段的同號說話者不保證是同一人。")
     if state.get("speaker_status") in {"running", "waiting", "paused"}:
