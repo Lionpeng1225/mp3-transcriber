@@ -1,0 +1,3 @@
+# Optional local speaker diarization. The model itself is downloaded after
+# accepting its Hugging Face conditions and providing a read access token.
+pyannote.audio>=4.0,<5

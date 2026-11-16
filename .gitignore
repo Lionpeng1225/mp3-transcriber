@@ -1,0 +1,26 @@
+# Local recordings, transcripts, credentials, models and runtime state
+.venv/
+__pycache__/
+*.py[cod]
+models/
+saved_jobs/
+tools/
+.speaker-token.dpapi
+.env
+.env.*
+.streamlit/secrets.toml
+*.mp3
+*.mp4
+*.wav
+*.m4a
+*.flac
+*.ogg
+*.srt
+*.vtt
+*.bin
+*.safetensors
+benchmark*.json
+buzz-engine-test.json
+*.log
+tmp*/
+.publish/
