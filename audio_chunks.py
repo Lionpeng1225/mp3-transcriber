@@ -14,6 +14,8 @@ def audio_chunks(path, chunk_seconds=120):
     filled = 0
     emitted = 0
     with av.open(str(path)) as container:
+        if not container.streams.audio:
+            raise ValueError("檔案沒有音軌，無法轉錄；請選擇含聲音音軌的 MP3 或 MP4。")
         resampler = av.AudioResampler(format="fltp", layout="mono", rate=SAMPLE_RATE)
 
         def frames():

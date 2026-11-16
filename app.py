@@ -6,9 +6,9 @@ from speaker_token_store import load_token, save_token, delete_token
 from transcription_job import (TERMINAL, TranscriptionJob, export_rows, timestamp,
                                register_job, get_job, saved_jobs, delete_job)
 
-st.set_page_config(page_title="MP3 轉逐字稿", page_icon="🎙️")
-st.title("MP3 轉逐字稿")
-st.write("選擇錄音，在本機辨識並下載繁體中文逐字稿。")
+st.set_page_config(page_title="MP3／MP4 轉逐字稿", page_icon="🎙️")
+st.title("MP3／MP4 轉逐字稿")
+st.write("選擇錄音或影片，在本機辨識並下載繁體中文逐字稿。")
 st.caption("首次使用各模型需連網下載。錄音每兩分鐘分段處理，時間標記依原始音檔累計。")
 st.caption("可選擇切分兩段並行轉錄：尋找至少 0.5 秒、音量不高於 −35 dBFS 且最靠近中點的靜音，前後兩段同時辨識；找不到則整段辨識。")
 if "job" not in st.session_state and st.query_params.get("job"):
@@ -80,7 +80,8 @@ if getattr(st.session_state.get("job"), "deleted", False):
     st.query_params.pop("job", None)
 job = st.session_state.get("job")
 active = job is not None and job.snapshot()["status"] not in TERMINAL
-recording = st.file_uploader("選擇 MP3 錄音", type=["mp3"], disabled=active)
+recording = st.file_uploader("選擇 MP3 錄音或 MP4 影片", type=["mp3", "mp4"], disabled=active)
+st.caption("MP4 會讀取第一條音軌，不辨識影片畫面或畫面中的字幕；不需先轉成 MP3。")
 engine_name = st.selectbox("轉錄引擎", ["faster-whisper", "whisper.cpp"], disabled=active)
 backend = {"engine": engine_name}
 backend_ready = True

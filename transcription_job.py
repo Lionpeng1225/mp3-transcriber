@@ -97,7 +97,10 @@ class TranscriptionJob:
         self.speaker_error = ""
         self.directory = STORE_ROOT / self.id
         self.directory.mkdir(parents=True)
-        self.source = self.directory / "recording.mp3"
+        extension = Path(recording.name).suffix.lower()
+        if extension not in {".mp3", ".mp4"}:
+            extension = ".mp3"
+        self.source = self.directory / ("recording" + extension)
         self.source.write_bytes(recording.getbuffer())
         self.save()
 
@@ -108,7 +111,8 @@ class TranscriptionJob:
                     and now - self.last_saved_at < PROGRESS_SAVE_INTERVAL):
                 return False
             data = self.snapshot()
-            data.update(id=self.id, size=self.size, language=self.language, backend=self.backend,
+            data.update(id=self.id, source_filename=self.source.name,
+                        size=self.size, language=self.language, backend=self.backend,
                         mode=self.mode, terms=self.terms,
                         resume_offset=self.resume_offset, committed_rows=self.committed_rows)
             data.update(speaker_labels=self.speaker_labels, speaker_status=self.speaker_status,
@@ -135,7 +139,10 @@ class TranscriptionJob:
         job.parallel_enabled = data.get("parallel_enabled", False)
         job.chunk_parallel_enabled = None
         job.directory = directory
-        job.source = directory / "recording.mp3"
+        source_filename = data.get("source_filename", "recording.mp3")
+        if source_filename not in {"recording.mp3", "recording.mp4"}:
+            raise ValueError("保存工作中的媒體檔名無效")
+        job.source = directory / source_filename
         job.condition = Condition()
         job.pause_requested = job.stop_requested = False
         job.status = data["status"] if data["status"] in TERMINAL else "interrupted"
