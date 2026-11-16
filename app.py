@@ -6,11 +6,20 @@ from speaker_token_store import load_token, save_token, delete_token
 from transcription_job import (TERMINAL, TranscriptionJob, export_rows, timestamp,
                                register_job, get_job, saved_jobs, delete_job)
 
+
+def job_snapshot(job):
+    if hasattr(job, "content_revision"):
+        return job.snapshot(include_rows=False)
+    # A hot reload can retain a job created by the previous module version.
+    state = job.snapshot()
+    state["row_count"] = len(state["rows"])
+    return state
+
 st.set_page_config(page_title="MP3／MP4 轉逐字稿", page_icon="🎙️")
 st.title("MP3／MP4 轉逐字稿")
 st.write("選擇錄音或影片，在本機辨識並下載繁體中文逐字稿。")
 st.caption("首次使用各模型需連網下載。錄音每兩分鐘分段處理，時間標記依原始音檔累計。")
-st.caption("可選擇切分兩段並行轉錄：尋找至少 0.5 秒、音量不高於 −35 dBFS 且最靠近中點的靜音，前後兩段同時辨識；找不到則整段辨識。")
+st.caption("可選擇切分兩段並行轉錄：尋找至少 0.5 秒、音量不高於 −35 dBFS 且最靠近中點的靜音，在附近切分並保留聲音與短重疊；找不到則整段辨識。")
 if "job" not in st.session_state and st.query_params.get("job"):
     try:
         st.session_state.job = get_job(st.query_params["job"])
@@ -79,7 +88,7 @@ if getattr(st.session_state.get("job"), "deleted", False):
     del st.session_state["job"]
     st.query_params.pop("job", None)
 job = st.session_state.get("job")
-active = job is not None and job.snapshot()["status"] not in TERMINAL
+active = job is not None and job_snapshot(job)["status"] not in TERMINAL
 recording = st.file_uploader("選擇 MP3 錄音或 MP4 影片", type=["mp3", "mp4"], disabled=active)
 st.caption("MP4 會讀取第一條音軌，不辨識影片畫面或畫面中的字幕；不需先轉成 MP3。")
 engine_name = st.selectbox("轉錄引擎", ["faster-whisper", "whisper.cpp"], disabled=active)
@@ -137,7 +146,9 @@ def job_panel():
     if getattr(job, "deleted", False):
         st.info("此保存工作已刪除。")
         return
-    state = job.snapshot()
+    state = job_snapshot(job)
+    if not hasattr(job, "content_revision"):
+        st.info("此工作仍使用更新前的引擎。保存進度後重新啟動程式，再開啟工作即可套用新版。")
     statuses = {
         "running": "轉錄中", "pausing": "等待目前辨識完成後暫停",
         "paused": "已暫停", "stopping": "等待目前辨識完成後停止",
@@ -194,9 +205,9 @@ def job_panel():
         st.caption("此工作使用更新前的程式；重新啟動並從保存點接續後，即可使用並行開關。")
     if state.get("preparing_model"):
         if state["status"] == "paused":
-            st.info("轉錄已暫停，模型仍在背景下載或載入。可隨時按「繼續轉錄」，模型準備完成後會自動開始辨識。")
+            st.info("轉錄已暫停；若正在載入模型，載入會在背景完成。可隨時按「繼續轉錄」，模型準備完成後會自動開始辨識。")
         else:
-            st.info("正在下載或載入模型，完成後會自動開始辨識；此階段尚未產生逐字稿。")
+            st.info("正在準備音訊快取或模型，完成後會自動開始辨識。")
     pause, resume, stop = st.columns(3)
     if pause.button("暫停", disabled=state["status"] != "running"):
         job.pause()
@@ -214,9 +225,9 @@ def job_panel():
     st.caption(f"設定時機：{timing_options.get(state.get('speaker_timing', 'manual'), '手動辨識')}。權杖使用上方共用設定。")
     if not importlib.util.find_spec("pyannote"):
         st.caption("首次使用前，請在程式資料夾執行：.venv\\Scripts\\python.exe -m pip install -r requirements-speakers.txt")
-    st.caption(f"說話者進度：已處理 {state.get('speaker_done', 0)}／{len(state['rows'])} 個文字片段；每完成約 30 秒就更新一次逐字稿。")
-    st.caption("每次從上次完成的位置接續；手動辨識只處理按下按鈕時的已轉錄範圍。同步模式會在模型檢查點隨轉錄暫停／繼續，模型載入與單次運算不能立即中斷。")
-    st.caption("標籤包含所屬音訊區段；不同區段的同號說話者不保證是同一人。")
+    st.caption(f"說話者進度：已處理 {state.get('speaker_done', 0)}／{state['row_count']} 個文字片段；每完成約 30 秒就更新一次逐字稿。")
+    st.caption("每次從上次完成的位置接續；手動辨識只處理按下按鈕時的已轉錄範圍。同步模式會在模型檢查點隨轉錄暫停／繼續，模型載入與單次運算不能立即中斷；尚未完成的分析批次可能在繼續後重算。")
+    st.caption("使用較長上下文與跨段聲音特徵比對；信心不足會標示未確認。說話者編號仍可能誤配，重要內容請校對。")
     if state.get("speaker_status") in {"running", "waiting", "paused"}:
         st.info(state.get("speaker_phase") or "說話者辨識進行中。")
     elif state.get("speaker_status") == "failed":
@@ -224,7 +235,7 @@ def job_panel():
     elif state.get("speaker_status") == "completed":
         st.success("本次指定範圍已完成；有新文字後可繼續辨識。")
     if st.button("辨識說話者", disabled=(state.get("speaker_status") in {"running", "waiting", "paused"}
-                                              or len(state["rows"]) <= state.get("speaker_done", 0))):
+                                              or state["row_count"] <= state.get("speaker_done", 0))):
         try:
             speaker_token = st.session_state.get("speaker_token_global", "")
             if not speaker_token.strip():
@@ -243,13 +254,16 @@ def job_panel():
                 st.error(f"無法接續：{error}")
     if state["status"] == "completed":
         st.success(f"處理 {state['processed'] / 60:.1f} 分鐘錄音，總耗時 {state['elapsed'] / 60:.1f} 分鐘（不含暫停時間）。")
-    if state["rows"]:
-        rows = state["rows"]
-        if state.get("speaker_labels"):
-            labels = state["speaker_labels"]
-            rows = [(start, end, f"{(labels[index] if index < len(labels) else None) or '未辨識'}：{text}")
-                    for index, (start, end, text) in enumerate(rows)]
-        output = export_rows(rows)
+    if state["row_count"]:
+        if hasattr(job, "export_payload"):
+            output = job.export_payload()
+        else:
+            labels = state.get("speaker_labels") or []
+            rows = [(a, b, f"{labels[i] or '未確認'}：{text}" if i < len(labels) else text)
+                    for i, (a, b, text) in enumerate(state["rows"])]
+            output = export_rows(rows)
+            output['preview'] = export_rows(rows[-300:])['timed']
+            output['downloads'] = {key: output[key].encode('utf-8-sig') for key in ('plain', 'timed', 'srt')}
         suffix = "_部分" if state["status"] != "completed" else ""
         st.caption("可隨時下載目前已完成內容，也可先暫停、下載，再繼續轉錄。")
         for label, field, extension, mime in [
@@ -257,9 +271,10 @@ def job_panel():
             ("下載含時間逐字稿", "timed", "_時間.txt", "text/plain"),
             ("下載字幕 SRT", "srt", ".srt", "application/x-subrip"),
         ]:
-            st.download_button(label, output[field].encode("utf-8-sig"),
+            st.download_button(label, output['downloads'][field],
                                state["name"] + suffix + extension, mime=mime, on_click="ignore")
-        st.text_area("逐字稿預覽", output["timed"], height=350, disabled=True)
+        st.caption("預覽顯示最近 300 段，下載檔案包含完整內容。")
+        st.text_area("逐字稿預覽", output["preview"], height=350, disabled=True)
     elif state["status"] == "completed":
         st.warning("沒有辨識到語音。")
     if state["status"] in TERMINAL:

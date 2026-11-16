@@ -22,5 +22,9 @@ tools/
 benchmark*.json
 buzz-engine-test.json
 *.log
+*.f32
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 tmp*/
 .publish/

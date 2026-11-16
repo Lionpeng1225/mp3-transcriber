@@ -12,6 +12,10 @@ from faster_whisper.utils import download_model
 from opencc import OpenCC
 from audio_chunks import SAMPLE_RATE, audio_chunks
 from parallel_segments import central_silence, transcribe_pair
+from audio_cache import AudioCache
+from job_storage import save_job, read_job
+from resource_scheduler import inference_slot
+from segment_boundaries import owned_segment
 
 MODEL_LOCK = Lock()
 TERMINAL = {"completed", "stopped", "failed", "interrupted"}
@@ -62,6 +66,10 @@ class Stopped(Exception):
     pass
 
 
+class SpeakerPaused(Exception):
+    pass
+
+
 class TranscriptionJob:
     def __init__(self, recording, size, language, mode, terms, backend=None, parallel_enabled=False,
                  speaker_timing="manual", speaker_token=""):
@@ -79,6 +87,11 @@ class TranscriptionJob:
         self.status = "running"
         self.phase = "等待載入模型"
         self.rows = []
+        self.words = []
+        self.speaker_parts = []
+        self.speaker_profiles = {}
+        self.content_revision = 0
+        self._export_cache = None
         self.processed = 0
         self.resume_offset = 0
         self.committed_rows = 0
@@ -106,6 +119,7 @@ class TranscriptionJob:
             extension = ".mp3"
         self.source = self.directory / ("recording" + extension)
         self.source.write_bytes(recording.getbuffer())
+        self.audio_cache = AudioCache(self.source)
         self.save()
 
     def save(self, force=True):
@@ -114,13 +128,17 @@ class TranscriptionJob:
             if (not force and self.last_saved_at is not None
                     and now - self.last_saved_at < PROGRESS_SAVE_INTERVAL):
                 return False
-            data = self.snapshot()
+            data = self.snapshot(include_rows=False)
             data.update(id=self.id, source_filename=self.source.name,
                         size=self.size, language=self.language, backend=self.backend,
                         mode=self.mode, terms=self.terms,
                         resume_offset=self.resume_offset, committed_rows=self.committed_rows)
-            data.update(speaker_labels=self.speaker_labels, speaker_status=self.speaker_status,
+            data.update(speaker_status=self.speaker_status, speaker_profiles=self.speaker_profiles,
                         speaker_error=self.speaker_error, speaker_timing=self.speaker_timing)
+            if not (self.directory / "progress.sqlite3").exists() and (self.directory / "state.json").exists():
+                import shutil
+                shutil.copy2(self.directory / "state.json", self.directory / "state.legacy.json")
+            save_job(self, data)
             temporary = self.directory / "state.tmp"
             with temporary.open("w", encoding="utf-8") as output:
                 json.dump(data, output, ensure_ascii=False)
@@ -133,7 +151,7 @@ class TranscriptionJob:
     @classmethod
     def restore(cls, job_id):
         directory = STORE_ROOT / job_id
-        data = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+        data = read_job(directory)
         job = cls.__new__(cls)
         for key in ("name", "size", "language", "mode", "terms", "rows", "processed",
                     "resume_offset", "committed_rows", "error"):
@@ -147,6 +165,12 @@ class TranscriptionJob:
         if source_filename not in {"recording.mp3", "recording.mp4"}:
             raise ValueError("保存工作中的媒體檔名無效")
         job.source = directory / source_filename
+        job.audio_cache = AudioCache(job.source)
+        job.words = data.get("words", [[] for _ in job.rows])
+        job.speaker_parts = data.get("speaker_parts", [])
+        job.speaker_profiles = data.get("speaker_profiles", {})
+        job.content_revision = 0
+        job._export_cache = None
         job.condition = Condition()
         job.pause_requested = job.stop_requested = False
         job.status = data["status"] if data["status"] in TERMINAL else "interrupted"
@@ -158,6 +182,9 @@ class TranscriptionJob:
         job.speaker_timing = data.get("speaker_timing", "manual")
         job.speaker_done = min(data.get("speaker_done", len(job.speaker_labels or [])), len(job.rows))
         job.speaker_labels = list(job.speaker_labels or [])[:job.speaker_done]
+        job.speaker_parts = (job.speaker_parts + [[] for _ in range(job.speaker_done)])[:job.speaker_done]
+        job._stored_rows = 0
+        job._stored_labels = 0
         job.speaker_revision = 0
         job.speaker_target = job.speaker_done
         job.speaker_run_mode = job.speaker_timing
@@ -182,7 +209,7 @@ class TranscriptionJob:
                 return
             if not self.source.exists():
                 raise FileNotFoundError("保存的錄音檔不存在，無法接續")
-            self.elapsed_before = self.snapshot()["elapsed"]
+            self.elapsed_before = self.snapshot(include_rows=False)["elapsed"]
             self.elapsed_paused_at = None
             self.paused_seconds = 0
             self.speaker_revision += 1
@@ -190,6 +217,11 @@ class TranscriptionJob:
             self.speaker_labels = list(self.speaker_labels or [])[:self.speaker_done]
             self.speaker_target = self.speaker_done
             self.rows = self.rows[:self.committed_rows]
+            self.words = self.words[:self.committed_rows]
+            self.speaker_parts = self.speaker_parts[:self.speaker_done]
+            self._stored_rows = min(getattr(self, "_stored_rows", 0), self.committed_rows)
+            self._stored_labels = min(getattr(self, "_stored_labels", 0), self.speaker_done)
+            self.content_revision += 1
             self.processed = self.resume_offset
             self.started = perf_counter()
             self.ended = None
@@ -203,6 +235,7 @@ class TranscriptionJob:
                 except OSError:
                     self._speaker_token = ""
             self.phase = "準備從最後完成的分段接續"
+            self.save()
             self.start()
 
     def start(self):
@@ -281,21 +314,23 @@ class TranscriptionJob:
                                          args=(token,), daemon=True)
             self.speaker_thread.start()
 
-    def _speaker_checkpoint(self):
+    def _speaker_checkpoint(self, nonblocking=False):
         with self.condition:
             while self.speaker_run_mode == "during" and (
                     self.pause_requested or self.status in {"paused", "pausing"}) and self.status not in TERMINAL:
                 self.speaker_status = "paused"
                 self.speaker_phase = "說話者辨識已暫停，等待繼續轉錄"
+                if nonblocking:
+                    raise SpeakerPaused()
                 self.condition.wait(timeout=1)
             if self.speaker_run_mode == "during" and (self.stop_requested or self.status in TERMINAL - {"completed"}):
                 raise Stopped()
             self.speaker_status = "running"
 
     def _run_speaker_diarization(self, token):
-        pipeline = None
         try:
-            from speaker_diarization import diarize_transcript, load_speaker_pipeline
+            from speaker_diarization import diarize_batch
+            self.audio_cache.ensure(self._speaker_checkpoint)
             while True:
                 self._speaker_checkpoint()
                 with self.condition:
@@ -326,23 +361,28 @@ class TranscriptionJob:
                     while finish < target and self.rows[finish][1] <= limit:
                         finish += 1
                     batch = list(self.rows[begin:finish])
+                    batch_words = list(self.words[begin:finish])
+                    profiles = dict(self.speaker_profiles)
+                    context_end = self.rows[target - 1][1]
                     revision = self.speaker_revision
                     self.speaker_phase = f"分析 {timestamp(batch[0][0])}–{timestamp(batch[-1][1])}"
-                if pipeline is None:
-                    self._speaker_checkpoint()
-                    pipeline = load_speaker_pipeline(token)
                 def progress(message):
                     with self.condition:
                         self.speaker_phase = f"{timestamp(batch[0][0])}–{timestamp(batch[-1][1])}：{message}"
-                labels = diarize_transcript(self.source, batch, token, progress,
-                                           pipeline=pipeline, checkpoint=self._speaker_checkpoint)
+                try:
+                    labels, parts, profiles = diarize_batch(
+                        self.audio_cache, batch, batch_words, token, profiles, context_end,
+                        progress, lambda: self._speaker_checkpoint(nonblocking=True))
+                except SpeakerPaused:
+                    continue  # Release the CPU slot and retry only this unfinished batch after resume.
                 with self.condition:
                     if revision != self.speaker_revision:
                         continue
-                    prefix = f"區段 {timestamp(batch[0][0])}／"
-                    self.speaker_labels = list(self.speaker_labels or [])[:begin] + [
-                        prefix + label if label else None for label in labels]
+                    self.speaker_labels = list(self.speaker_labels or [])[:begin] + labels
+                    self.speaker_parts = self.speaker_parts[:begin] + parts
+                    self.speaker_profiles = profiles
                     self.speaker_done = finish
+                    self.content_revision += 1
                     self.save()
         except Stopped:
             with self.condition:
@@ -407,14 +447,15 @@ class TranscriptionJob:
             if self.stop_requested:
                 raise Stopped()
 
-    def snapshot(self):
+    def snapshot(self, include_rows=True):
         with self.condition:
             return dict(name=self.name, status=self.status, phase=self.phase,
-                        rows=list(self.rows), processed=self.processed,
+                        rows=list(self.rows) if include_rows else [], row_count=len(self.rows),
+                        content_revision=self.content_revision, processed=self.processed,
                         preparing_model=self.preparing_model,
                         parallel_enabled=self.parallel_enabled,
                         chunk_parallel_enabled=self.chunk_parallel_enabled,
-                        speaker_labels=list(self.speaker_labels or []),
+                        speaker_labels=list(self.speaker_labels or []) if include_rows else [],
                         speaker_done=self.speaker_done,
                         speaker_status=self.speaker_status,
                         speaker_timing=self.speaker_timing,
@@ -428,85 +469,118 @@ class TranscriptionJob:
                             perf_counter() - self.transcribing_since if self.transcribing_since is not None else 0),
                         error=self.error)
 
+    def export_payload(self):
+        with self.condition:
+            if self._export_cache is not None and self._export_cache[0] == self.content_revision:
+                return self._export_cache[1]
+            rows = []
+            for i, (a, b, text) in enumerate(self.rows):
+                if i < len(self.speaker_parts) and self.speaker_parts[i]:
+                    rows.extend((x, y, f"{label or '未確認'}：{word}")
+                                for x, y, word, label in self.speaker_parts[i])
+                elif self.speaker_done:
+                    label = self.speaker_labels[i] if i < len(self.speaker_labels) else None
+                    rows.append((a, b, f"{label or '未確認'}：{text}"))
+                else:
+                    rows.append((a, b, text))
+            output = export_rows(rows)
+            output['preview'] = export_rows(rows[-300:])['timed']
+            output['downloads'] = {key: output[key].encode('utf-8-sig') for key in ('plain', 'timed', 'srt')}
+            self._export_cache = (self.content_revision, output)
+            return output
+
+    def _recognize_chunk(self, audio, core_start, parallel_enabled, options):
+        while True:
+            with inference_slot(self.checkpoint):
+                with self.condition:
+                    self.preparing_model = True
+                if self.backend["engine"] == "whisper.cpp":
+                    from whisper_cpp_engine import WhisperCppEngine
+                    engine_factory = lambda: WhisperCppEngine(self.backend, self.check_stop)
+                    engine = engine_factory()
+                else:
+                    model = load_model(self.size)
+                    engine_factory = lambda: model if self.mode == "原始精細" else BatchedInferencePipeline(model)
+                    engine = engine_factory()
+                with self.condition:
+                    self.preparing_model = False
+                # Do not hold the global slot while paused. In-flight inference finishes its batch.
+                if self.pause_requested:
+                    segments_list = None
+                else:
+                    self.check_stop()
+                    with self.condition:
+                        self.transcribing_since = perf_counter()
+                        self.phase = f"轉錄 {timestamp(core_start)} 起的片段（含邊界上下文）"
+                    gap = central_silence(audio) if parallel_enabled else None
+                    opts = dict(language=self.language, vad_filter=True, word_timestamps=True,
+                                hotwords=self.terms.strip() or None, **options)
+                    if gap is not None:
+                        segments = transcribe_pair(audio, gap, engine_factory, opts, self.check_stop)
+                    else:
+                        segments, _ = engine.transcribe(audio, **opts)
+                    try:
+                        segments_list = []
+                        for segment in segments:
+                            self.check_stop()
+                            segments_list.append(segment)
+                    finally:
+                        segments.close()
+                        with self.condition:
+                            self.stop_transcription_clock()
+                del engine, engine_factory
+                if self.backend["engine"] != "whisper.cpp":
+                    del model
+            if segments_list is not None:
+                return segments_list
+            self.checkpoint()
+
     def run(self):
-        acquired = False
         outcome = "completed"
         try:
-            self.checkpoint()
-            while not acquired:
-                acquired = MODEL_LOCK.acquire(timeout=0.2)
-                self.checkpoint()
             with self.condition:
                 self.preparing_model = True
-                self.phase = "載入模型（首次使用會下載模型）"
-            if self.backend["engine"] == "whisper.cpp":
-                from whisper_cpp_engine import WhisperCppEngine
-                cached_model.cache_clear()
-                gc.collect()
-                engine = WhisperCppEngine(self.backend, self.check_stop)
-                engine_factory = lambda: WhisperCppEngine(self.backend, self.check_stop)
-            else:
-                model = load_model(self.size)
-                engine = model if self.mode == "原始精細" else BatchedInferencePipeline(model)
-                engine_factory = lambda: model if self.mode == "原始精細" else BatchedInferencePipeline(model)
+                self.phase = "建立共用音訊快取（每份錄音只需解碼一次）"
+            duration = self.audio_cache.ensure(self.checkpoint)
             with self.condition:
                 self.preparing_model = False
-                self.phase = "模型準備完成，等待開始轉錄"
             self.checkpoint()
             if self.speaker_timing == "during":
                 self._launch_speaker_diarization(self._speaker_token or self._load_saved_speaker_token())
-            options = {
-                "快速": {"beam_size": 5, "batch_size": 2},
-                "極速": {"beam_size": 1, "batch_size": 2},
-                "原始精細": {"beam_size": 5},
-            }[self.mode]
+            options = {"快速": {"beam_size": 5, "batch_size": 2},
+                       "極速": {"beam_size": 1, "batch_size": 2},
+                       "原始精細": {"beam_size": 5}}[self.mode]
             converter = OpenCC("s2twp")
-            chunks = audio_chunks(self.source)
-            try:
-                for offset, audio in chunks:
-                    self.checkpoint()
-                    duration = len(audio) / SAMPLE_RATE
-                    if offset + duration <= self.resume_offset:
+            for core_start, core_end, offset, audio in self.audio_cache.windows(duration, self.resume_offset):
+                self.checkpoint()
+                with self.condition:
+                    self.chunk_parallel_enabled = self.parallel_enabled
+                    parallel_enabled = self.chunk_parallel_enabled
+                    self.phase = f"等待運算資源：{timestamp(core_start)} 起的片段"
+                segments_list = self._recognize_chunk(audio, core_start, parallel_enabled, options)
+                for raw_segment in segments_list:
+                    segment = owned_segment(raw_segment, offset, core_start, core_end)
+                    if segment is None:
                         continue
+                    text = converter.convert(segment.text.strip())
+                    a, b = max(0, segment.start), min(duration, segment.end)
                     with self.condition:
-                        self.chunk_parallel_enabled = self.parallel_enabled
-                        parallel_enabled = self.chunk_parallel_enabled
-                        self.phase = f"轉錄 {timestamp(offset)} 起的片段"
-                        if self.transcribing_since is None:
-                            self.transcribing_since = perf_counter()
-                    gap = central_silence(audio) if parallel_enabled else None
-                    transcribe_options = dict(language=self.language, vad_filter=True,
-                                              hotwords=self.terms.strip() or None, **options)
-                    if gap is not None:
-                        with self.condition:
-                            self.phase = (f"同時轉錄 {timestamp(offset)} 起的前後兩段；"
-                                          f"略過靜音 {timestamp(offset + gap[0] / SAMPLE_RATE)}"
-                                          f"–{timestamp(offset + gap[1] / SAMPLE_RATE)}")
-                        segments = transcribe_pair(audio, gap, engine_factory, transcribe_options, self.check_stop)
-                    else:
-                        segments, _ = engine.transcribe(audio, **transcribe_options)
-                    try:
-                        for segment in segments:
-                            text = converter.convert(segment.text.strip())
-                            start = offset + min(max(segment.start, 0), duration)
-                            end = offset + min(max(segment.end, 0), duration)
-                            with self.condition:
-                                if text and end > start:
-                                    self.rows.append((start, end, text))
-                                self.processed = max(self.processed, end)
-                            self.save(force=False)
-                            self.checkpoint()
-                    finally:
-                        segments.close()
-                    with self.condition:
-                        self.processed = offset + duration
-                        self.resume_offset = self.processed
-                        self.committed_rows = len(self.rows)
-                    self.save(force=True)
-                    del audio
+                        if text and b > a:
+                            self.rows.append((a, b, text))
+                            self.words.append([(max(0, w.start), min(duration, w.end), w.word)
+                                               for w in segment.words])
+                            self.content_revision += 1
+                        self.processed = max(self.processed, min(core_end, b))
+                        self.condition.notify_all()
+                    self.save(force=False)
                     self.checkpoint()
-            finally:
-                chunks.close()
+                with self.condition:
+                    self.processed = self.resume_offset = core_end
+                    self.committed_rows = len(self.rows)
+                    self.condition.notify_all()
+                self.save()
+                del audio, segments_list
+                self.checkpoint()
         except Stopped:
             outcome = "stopped"
         except Exception as error:
@@ -514,8 +588,6 @@ class TranscriptionJob:
             with self.condition:
                 self.error = str(error)
         finally:
-            if acquired:
-                MODEL_LOCK.release()
             with self.condition:
                 self.preparing_model = False
                 self.stop_transcription_clock()

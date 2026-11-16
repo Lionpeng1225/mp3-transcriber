@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from audio_chunks import SAMPLE_RATE
+from segment_boundaries import owned_segment
 
 
 def central_silence(audio, sample_rate=SAMPLE_RATE, threshold_db=-35):
@@ -35,7 +36,9 @@ def transcribe_pair(audio, gap, engine_factory, options, stop_check):
     thread-safe Whisper model. Results keep original audio-relative timestamps.
     """
     abort = Event()
-    def recognize(start, end):
+    cut = (gap[0] + gap[1]) // 2
+    padding = SAMPLE_RATE
+    def recognize(start, end, core_start, core_end):
         stop_check()
         segments, _ = engine_factory().transcribe(audio[start:end], **options)
         rows = []
@@ -44,12 +47,10 @@ def transcribe_pair(audio, gap, engine_factory, options, stop_check):
                 stop_check()
                 if abort.is_set():
                     return []
-                duration = (end - start) / SAMPLE_RATE
-                rows.append(SimpleNamespace(
-                    start=start / SAMPLE_RATE + min(max(segment.start, 0), duration),
-                    end=start / SAMPLE_RATE + min(max(segment.end, 0), duration),
-                    text=segment.text,
-                ))
+                owned = owned_segment(segment, start / SAMPLE_RATE,
+                                      core_start / SAMPLE_RATE, core_end / SAMPLE_RATE)
+                if owned is not None:
+                    rows.append(owned)
             return rows
         except BaseException:
             abort.set()
@@ -58,8 +59,9 @@ def transcribe_pair(audio, gap, engine_factory, options, stop_check):
             segments.close()
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(recognize, 0, gap[0]),
-                   pool.submit(recognize, gap[1], len(audio))]
+        # Quiet audio is retained. Both sides get context, each word belongs to one core.
+        futures = [pool.submit(recognize, 0, min(len(audio), cut + padding), 0, cut),
+                   pool.submit(recognize, max(0, cut - padding), len(audio), cut, len(audio))]
         try:
             results = [future.result() for future in futures]
         finally:
