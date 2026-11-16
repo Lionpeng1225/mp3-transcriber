@@ -168,7 +168,7 @@ def job_panel():
             st.rerun()
         except (OSError, ValueError) as error:
             st.error(f"無法更新此工作的辨識時機：{error}")
-    st.caption("已保存工作也可在此更改；選擇會保存並套用於此工作。每次暫停時開始會在每次按下暫停時啟動分析。")
+    st.caption("已保存工作也可在此更改；選擇會保存並套用於此工作。每次暫停時，只分析實際暫停時已轉錄且尚未標記的部分。")
     if transcription_elapsed is None:
         st.caption("此工作在更新前啟動，尚未記錄實際轉錄耗時；仍可暫停、繼續與下載逐字稿。")
     st.caption("音檔時長包含已略過的靜音；已經過時間包含下載與載入。實際暫停後所有時間停止累計，繼續轉錄後恢復。")
@@ -214,20 +214,21 @@ def job_panel():
     st.caption(f"設定時機：{timing_options.get(state.get('speaker_timing', 'manual'), '手動辨識')}。權杖使用上方共用設定。")
     if not importlib.util.find_spec("pyannote"):
         st.caption("首次使用前，請在程式資料夾執行：.venv\\Scripts\\python.exe -m pip install -r requirements-speakers.txt")
-    if state.get("speaker_status") == "running":
+    st.caption(f"說話者進度：已處理 {state.get('speaker_done', 0)}／{len(state['rows'])} 個文字片段。")
+    st.caption("每次從上次完成的位置接續；手動辨識只處理按下按鈕時的已轉錄範圍。同步模式會在模型檢查點隨轉錄暫停／繼續，模型載入與單次運算不能立即中斷。")
+    st.caption("標籤包含所屬音訊區段；不同區段的同號說話者不保證是同一人。")
+    if state.get("speaker_status") in {"running", "waiting", "paused"}:
         st.info(state.get("speaker_phase") or "說話者辨識進行中。")
     elif state.get("speaker_status") == "failed":
         st.error(state.get("speaker_error", "說話者辨識失敗"))
     elif state.get("speaker_status") == "completed":
-        count = len({x for x in (state.get("speaker_labels") or []) if x})
-        st.success(f"說話者辨識完成，共辨識 {count} 位說話者。")
-    if st.button("辨識說話者", disabled=state.get("speaker_status") in {"running", "completed"}):
+        st.success("本次指定範圍已完成；有新文字後可繼續辨識。")
+    if st.button("辨識說話者", disabled=(state.get("speaker_status") in {"running", "waiting", "paused"}
+                                              or len(state["rows"]) <= state.get("speaker_done", 0))):
         try:
             speaker_token = st.session_state.get("speaker_token_global", "")
             if not speaker_token.strip():
                 raise ValueError("請先在上方的共用權杖設定中輸入並記住 Hugging Face Read 權杖。")
-            if state["status"] != "completed":
-                raise ValueError(f"目前工作狀態是「{state['status']}」；請等轉錄完成後再試。")
             job.start_speaker_diarization(speaker_token)
             st.rerun()
         except (OSError, ValueError) as error:
@@ -244,8 +245,9 @@ def job_panel():
         st.success(f"處理 {state['processed'] / 60:.1f} 分鐘錄音，總耗時 {state['elapsed'] / 60:.1f} 分鐘（不含暫停時間）。")
     if state["rows"]:
         rows = state["rows"]
-        if state.get("speaker_status") == "completed" and state.get("speaker_labels"):
-            rows = [(start, end, f"{state['speaker_labels'][index] or '未辨識'}：{text}")
+        if state.get("speaker_labels"):
+            labels = state["speaker_labels"]
+            rows = [(start, end, f"{(labels[index] if index < len(labels) else None) or '未辨識'}：{text}")
                     for index, (start, end, text) in enumerate(rows)]
         output = export_rows(rows)
         suffix = "_部分" if state["status"] != "completed" else ""

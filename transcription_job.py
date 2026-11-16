@@ -92,7 +92,11 @@ class TranscriptionJob:
         self.ended = None
         self.error = ""
         self.last_saved_at = None
-        self.speaker_labels = None
+        self.speaker_labels = []
+        self.speaker_done = 0
+        self.speaker_revision = 0
+        self.speaker_target = 0
+        self.speaker_run_mode = speaker_timing
         self.speaker_status = "not_started"
         self.speaker_error = ""
         self.directory = STORE_ROOT / self.id
@@ -152,8 +156,13 @@ class TranscriptionJob:
         job.speaker_status = data.get("speaker_status", "not_started")
         job.speaker_error = data.get("speaker_error", "")
         job.speaker_timing = data.get("speaker_timing", "manual")
+        job.speaker_done = min(data.get("speaker_done", len(job.speaker_labels or [])), len(job.rows))
+        job.speaker_labels = list(job.speaker_labels or [])[:job.speaker_done]
+        job.speaker_revision = 0
+        job.speaker_target = job.speaker_done
+        job.speaker_run_mode = job.speaker_timing
         job._speaker_token = ""
-        if job.speaker_status == "running":
+        if job.speaker_status in {"running", "paused", "waiting"}:
             job.speaker_status = "failed"
             job.speaker_error = "程式曾在說話者辨識期間關閉，請重新啟動辨識。"
         job.elapsed_before = data["elapsed"]
@@ -176,6 +185,10 @@ class TranscriptionJob:
             self.elapsed_before = self.snapshot()["elapsed"]
             self.elapsed_paused_at = None
             self.paused_seconds = 0
+            self.speaker_revision += 1
+            self.speaker_done = min(self.speaker_done, self.committed_rows)
+            self.speaker_labels = list(self.speaker_labels or [])[:self.speaker_done]
+            self.speaker_target = self.speaker_done
             self.rows = self.rows[:self.committed_rows]
             self.processed = self.resume_offset
             self.started = perf_counter()
@@ -206,10 +219,11 @@ class TranscriptionJob:
                     if self.elapsed_paused_at is None:
                         self.elapsed_paused_at = perf_counter()
                     self.status = "paused"
+                    if self.speaker_timing == "pause":
+                        self._launch_speaker_diarization(self._speaker_token or self._load_saved_speaker_token())
                 else:
                     self.status = "pausing"
-                if self.speaker_timing == "pause":
-                    self._launch_speaker_diarization(self._speaker_token or self._load_saved_speaker_token())
+                self.condition.notify_all()
 
     def set_parallel_enabled(self, enabled):
         with self.condition:
@@ -223,23 +237,21 @@ class TranscriptionJob:
             raise ValueError("無效的說話者辨識時機")
         with self.condition:
             self.speaker_timing = timing
+            self.speaker_run_mode = timing
+            self.speaker_target = len(self.rows)
             if token:
                 self._speaker_token = token
+            self.condition.notify_all()
             self.save()
-            if timing == "during" and (
-                    self.status not in TERMINAL
-                    or (self.status == "completed" and self.speaker_status != "completed")):
-                self._launch_speaker_diarization(self._speaker_token or self._load_saved_speaker_token())
-            elif timing == "pause" and self.status == "paused":
-                self._launch_speaker_diarization(self._speaker_token or self._load_saved_speaker_token())
-            elif timing == "after" and self.status == "completed":
+            if (timing == "during" or (timing == "pause" and self.status == "paused")
+                    or (timing == "after" and self.status == "completed")):
                 self._launch_speaker_diarization(self._speaker_token or self._load_saved_speaker_token())
 
     def start_speaker_diarization(self, token):
         with self.condition:
-            if self.status != "completed":
-                raise ValueError("請先完成轉錄，再辨識說話者")
-            self._launch_speaker_diarization(token)
+            if len(self.rows) <= self.speaker_done:
+                raise ValueError("目前沒有尚未辨識說話者的已轉錄片段")
+            self._launch_speaker_diarization(token, mode="manual")
 
     def _load_saved_speaker_token(self):
         try:
@@ -248,13 +260,18 @@ class TranscriptionJob:
         except OSError:
             return ""
 
-    def _launch_speaker_diarization(self, token):
+    def _launch_speaker_diarization(self, token, mode=None):
         with self.condition:
-            if self.speaker_status == "running":
+            self.speaker_run_mode = mode or self.speaker_timing
+            self.speaker_target = len(self.rows)
+            self.condition.notify_all()
+            if getattr(self, "speaker_thread", None) and self.speaker_thread.is_alive():
+                return
+            if self.speaker_run_mode != "during" and self.speaker_target <= self.speaker_done:
                 return
             if not token:
                 self.speaker_status = "failed"
-                self.speaker_error = "尚未保存 Hugging Face 權杖；請在上方權杖設定中記住權杖後重試。"
+                self.speaker_error = "請先輸入或保存 Hugging Face Read 權杖。"
                 self.save()
                 return
             self.speaker_status = "running"
@@ -264,28 +281,81 @@ class TranscriptionJob:
                                          args=(token,), daemon=True)
             self.speaker_thread.start()
 
+    def _speaker_checkpoint(self):
+        with self.condition:
+            while self.speaker_run_mode == "during" and (
+                    self.pause_requested or self.status in {"paused", "pausing"}) and self.status not in TERMINAL:
+                self.speaker_status = "paused"
+                self.speaker_phase = "說話者辨識已暫停，等待繼續轉錄"
+                self.condition.wait(timeout=1)
+            if self.speaker_run_mode == "during" and (self.stop_requested or self.status in TERMINAL - {"completed"}):
+                raise Stopped()
+            self.speaker_status = "running"
+
     def _run_speaker_diarization(self, token):
+        pipeline = None
         try:
-            from speaker_diarization import diarize_transcript
-            def progress(message):
+            from speaker_diarization import diarize_transcript, load_speaker_pipeline
+            while True:
+                self._speaker_checkpoint()
                 with self.condition:
-                    self.speaker_phase = message
-            def transcript_rows():
-                with self.condition:
-                    while self.status not in TERMINAL:
+                    target = len(self.rows) if self.speaker_run_mode == "during" else self.speaker_target
+                    if self.speaker_done >= target:
+                        if self.speaker_run_mode == "during" and self.status not in TERMINAL:
+                            self.speaker_status = "waiting"
+                            self.speaker_phase = "等待新的已轉錄片段"
+                            self.condition.wait(timeout=1)
+                            continue
+                        self.speaker_status = "completed"
+                        self.speaker_phase = "本次已轉錄範圍的說話者辨識完成"
+                        self.save()
+                        self.speaker_thread = None
+                        return
+                    begin = self.speaker_done
+                    # In synchronous mode, collect a completed audio chunk before
+                    # clustering instead of assigning identities to isolated words.
+                    if (self.speaker_run_mode == "during" and self.status not in TERMINAL
+                            and self.resume_offset <= self.rows[begin][0]
+                            and self.rows[target - 1][1] - self.rows[begin][0] < 120):
+                        self.speaker_status = "waiting"
+                        self.speaker_phase = "等待目前轉錄分段完成後分析說話者"
                         self.condition.wait(timeout=1)
-                    return list(self.rows)
-            labels = diarize_transcript(self.source, transcript_rows, token, progress)
+                        continue
+                    limit = self.rows[begin][0] + 120
+                    finish = begin + 1
+                    while finish < target and self.rows[finish][1] <= limit:
+                        finish += 1
+                    batch = list(self.rows[begin:finish])
+                    revision = self.speaker_revision
+                    self.speaker_phase = f"分析 {timestamp(batch[0][0])}–{timestamp(batch[-1][1])}"
+                if pipeline is None:
+                    self._speaker_checkpoint()
+                    pipeline = load_speaker_pipeline(token)
+                def progress(message):
+                    with self.condition:
+                        self.speaker_phase = f"{timestamp(batch[0][0])}–{timestamp(batch[-1][1])}：{message}"
+                labels = diarize_transcript(self.source, batch, token, progress,
+                                           pipeline=pipeline, checkpoint=self._speaker_checkpoint)
+                with self.condition:
+                    if revision != self.speaker_revision:
+                        continue
+                    prefix = f"區段 {timestamp(batch[0][0])}／"
+                    self.speaker_labels = list(self.speaker_labels or [])[:begin] + [
+                        prefix + label if label else None for label in labels]
+                    self.speaker_done = finish
+                    self.save()
+        except Stopped:
             with self.condition:
-                self.speaker_labels = labels
-                self.speaker_status = "completed"
-                self.speaker_phase = "說話者辨識完成"
+                self.speaker_status = "interrupted"
+                self.speaker_phase = "說話者辨識已停止；已完成區段已保存"
+                self.speaker_thread = None
                 self.save()
         except Exception as error:
             with self.condition:
                 self.speaker_status = "failed"
                 self.speaker_error = str(error)
-                self.speaker_phase = "說話者辨識失敗"
+                self.speaker_phase = "說話者辨識失敗；可從已保存進度重試"
+                self.speaker_thread = None
                 self.save()
 
     def resume(self):
@@ -312,7 +382,10 @@ class TranscriptionJob:
                 self.stop_transcription_clock()
                 if self.elapsed_paused_at is None:
                     self.elapsed_paused_at = perf_counter()
+                newly_paused = self.status != "paused"
                 self.status = "paused"
+                if newly_paused and self.speaker_timing == "pause":
+                    self._launch_speaker_diarization(self._speaker_token or self._load_saved_speaker_token())
                 self.save()
                 self.condition.wait()
             if self.stop_requested:
@@ -341,7 +414,8 @@ class TranscriptionJob:
                         preparing_model=self.preparing_model,
                         parallel_enabled=self.parallel_enabled,
                         chunk_parallel_enabled=self.chunk_parallel_enabled,
-                        speaker_labels=self.speaker_labels,
+                        speaker_labels=list(self.speaker_labels or []),
+                        speaker_done=self.speaker_done,
                         speaker_status=self.speaker_status,
                         speaker_timing=self.speaker_timing,
                         speaker_phase=getattr(self, "speaker_phase", ""),
@@ -497,6 +571,7 @@ def delete_job(job_id):
             if job is not None and (
                 job.status not in TERMINAL
                 or (getattr(job, "thread", None) is not None and job.thread.is_alive())
+                or (getattr(job, "speaker_thread", None) is not None and job.speaker_thread.is_alive())
             ):
                 raise ValueError("請先停止轉錄，等待工作結束後再刪除；暫停中的工作不能刪除。")
             if directory.exists():

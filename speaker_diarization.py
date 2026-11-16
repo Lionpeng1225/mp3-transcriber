@@ -1,56 +1,53 @@
-"""Optional local speaker diarization using pyannote Community-1."""
+"""Incremental speaker analysis with cooperative pause checkpoints."""
 
 
-def diarize_transcript(audio_path, rows, token, progress=None):
-    try:
-        import av
-        import numpy as np
-        import torch
-        from pyannote.audio import Pipeline
-    except ImportError as error:
-        raise RuntimeError(
-            "尚未安裝說話者辨識套件。請在程式資料夾執行："
-            ".venv\\Scripts\\python.exe -m pip install -r requirements-speakers.txt"
-        ) from error
-
-    if not token or not token.strip():
-        raise ValueError("請輸入 Hugging Face 存取權杖")
-    if progress:
-        progress("載入說話者辨識模型（首次使用會下載）")
+def load_speaker_pipeline(token):
+    import torch
+    from pyannote.audio import Pipeline
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-community-1", token=token.strip())
     if pipeline is None:
         raise RuntimeError("無法載入模型；請確認已在 Hugging Face 同意模型條款")
     pipeline.to(torch.device("cpu"))
-    if progress:
-        progress("使用本機音訊解碼器載入錄音")
-    # Decode through PyAV (already used by the transcription app) and pass
-    # samples directly, avoiding TorchCodec's FFmpeg DLL loading on Windows.
+    return pipeline
+
+
+def diarize_transcript(audio_path, rows, token, progress=None, *, pipeline=None,
+                       checkpoint=lambda: None):
+    import numpy as np
+    import torch
     from audio_chunks import audio_chunks, SAMPLE_RATE
-    with av.open(str(audio_path)) as container:
-        duration = (container.duration or 0) / av.time_base
-    capacity = max(SAMPLE_RATE, int((duration + 2) * SAMPLE_RATE))
-    waveform = np.empty(capacity, dtype=np.float32)
-    filled = 0
-    for _offset, chunk in audio_chunks(audio_path):
-        end = filled + len(chunk)
-        if end > len(waveform):
-            grown = np.empty(max(end, len(waveform) * 2), dtype=np.float32)
-            grown[:filled] = waveform[:filled]
-            waveform = grown
-        waveform[filled:end] = chunk
-        filled = end
-    samples = torch.from_numpy(waveform[:filled]).unsqueeze(0)
-    if progress:
-        progress("分析錄音中的說話者（PyAV 解碼）")
-    output = pipeline({"waveform": samples, "sample_rate": SAMPLE_RATE})
-    turns = output.exclusive_speaker_diarization
-    if callable(rows):
-        rows = rows()
-    labels = []
-    for start, end, _text in rows:
-        midpoint = (start + end) / 2
-        speaker = next((str(label) for turn, label in turns
-                        if turn.start <= midpoint < turn.end), None)
-        labels.append(speaker)
-    return labels
+    if not rows:
+        return []
+    checkpoint()
+    if pipeline is None:
+        pipeline = load_speaker_pipeline(token)
+    first = round(min(row[0] for row in rows) * SAMPLE_RATE)
+    last = round(max(row[1] for row in rows) * SAMPLE_RATE)
+    pieces = []
+    chunks = audio_chunks(audio_path)
+    try:
+        for offset, chunk in chunks:
+            checkpoint()
+            base = round(offset * SAMPLE_RATE)
+            lo, hi = max(first - base, 0), min(last - base, len(chunk))
+            if hi > lo:
+                pieces.append(chunk[lo:hi].copy())
+            if base + len(chunk) >= last:
+                break
+    finally:
+        chunks.close()
+    if not pieces:
+        raise ValueError("已轉錄區段沒有可讀取的音訊")
+    samples = torch.from_numpy(np.concatenate(pieces)).unsqueeze(0)
+    checkpoint()
+    def hook(step_name, *args, **kwargs):
+        checkpoint()
+        if progress:
+            progress(f"說話者分析：{step_name}")
+    output = pipeline({"waveform": samples, "sample_rate": SAMPLE_RATE}, hook=hook)
+    checkpoint()
+    turns = list(output.exclusive_speaker_diarization)
+    return [next((str(label) for turn, label in turns
+                  if turn.start <= (a + b) / 2 - first / SAMPLE_RATE < turn.end), None)
+            for a, b, _ in rows]
