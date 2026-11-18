@@ -9,6 +9,7 @@ from time import perf_counter
 
 from faster_whisper import BatchedInferencePipeline, WhisperModel
 from faster_whisper.utils import download_model
+from adaptive_decoding import AdaptiveDecodingPipeline
 from opencc import OpenCC
 from audio_chunks import SAMPLE_RATE, audio_chunks
 from parallel_segments import central_silence, transcribe_pair
@@ -72,13 +73,15 @@ class SpeakerPaused(Exception):
 
 class TranscriptionJob:
     def __init__(self, recording, size, language, mode, terms, backend=None, parallel_enabled=False,
-                 speaker_timing="manual", speaker_token=""):
+                 speaker_timing="manual", speaker_token="", word_timestamps=True):
         self.id = uuid4().hex
         self.name = Path(recording.name).stem
         self.size, self.language, self.mode, self.terms = size, language, mode, terms
         self.backend = backend or {"engine": "faster-whisper"}
         self.parallel_enabled = bool(parallel_enabled)
         self.chunk_parallel_enabled = None
+        self.word_timestamps = bool(word_timestamps)
+        self.chunk_word_timestamps = None
         self.speaker_timing = speaker_timing
         self._speaker_token = speaker_token
         self.condition = Condition()
@@ -131,7 +134,7 @@ class TranscriptionJob:
             data = self.snapshot(include_rows=False)
             data.update(id=self.id, source_filename=self.source.name,
                         size=self.size, language=self.language, backend=self.backend,
-                        mode=self.mode, terms=self.terms,
+                        mode=self.mode, terms=self.terms, word_timestamps=self.word_timestamps,
                         resume_offset=self.resume_offset, committed_rows=self.committed_rows)
             data.update(speaker_status=self.speaker_status, speaker_profiles=self.speaker_profiles,
                         speaker_error=self.speaker_error, speaker_timing=self.speaker_timing)
@@ -160,6 +163,8 @@ class TranscriptionJob:
         job.backend = data.get("backend", {"engine": "faster-whisper"})
         job.parallel_enabled = data.get("parallel_enabled", False)
         job.chunk_parallel_enabled = None
+        job.word_timestamps = data.get("word_timestamps", True)
+        job.chunk_word_timestamps = None
         job.directory = directory
         source_filename = data.get("source_filename", "recording.mp3")
         if source_filename not in {"recording.mp3", "recording.mp4"}:
@@ -263,6 +268,13 @@ class TranscriptionJob:
             if getattr(self, "deleted", False):
                 raise ValueError("此工作已刪除")
             self.parallel_enabled = bool(enabled)
+            self.save()
+
+    def set_word_timestamps(self, enabled):
+        with self.condition:
+            if getattr(self, "deleted", False):
+                raise ValueError("此工作已刪除")
+            self.word_timestamps = bool(enabled)
             self.save()
 
     def set_speaker_timing(self, timing, token=""):
@@ -455,6 +467,9 @@ class TranscriptionJob:
                         preparing_model=self.preparing_model,
                         parallel_enabled=self.parallel_enabled,
                         chunk_parallel_enabled=self.chunk_parallel_enabled,
+                        backend=dict(self.backend),
+                        word_timestamps=self.word_timestamps,
+                        chunk_word_timestamps=self.chunk_word_timestamps,
                         speaker_labels=list(self.speaker_labels or []) if include_rows else [],
                         speaker_done=self.speaker_done,
                         speaker_status=self.speaker_status,
@@ -489,7 +504,7 @@ class TranscriptionJob:
             self._export_cache = (self.content_revision, output)
             return output
 
-    def _recognize_chunk(self, audio, core_start, parallel_enabled, options):
+    def _recognize_chunk(self, audio, core_start, parallel_enabled, word_timestamps, options):
         while True:
             with inference_slot(self.checkpoint):
                 with self.condition:
@@ -500,7 +515,10 @@ class TranscriptionJob:
                     engine = engine_factory()
                 else:
                     model = load_model(self.size)
-                    engine_factory = lambda: model if self.mode == "原始精細" else BatchedInferencePipeline(model)
+                    if self.mode == "自適應快速":
+                        engine_factory = lambda: AdaptiveDecodingPipeline(model, self.check_stop)
+                    else:
+                        engine_factory = lambda: model if self.mode == "原始精細" else BatchedInferencePipeline(model)
                     engine = engine_factory()
                 with self.condition:
                     self.preparing_model = False
@@ -513,7 +531,7 @@ class TranscriptionJob:
                         self.transcribing_since = perf_counter()
                         self.phase = f"轉錄 {timestamp(core_start)} 起的片段（含邊界上下文）"
                     gap = central_silence(audio) if parallel_enabled else None
-                    opts = dict(language=self.language, vad_filter=True, word_timestamps=True,
+                    opts = dict(language=self.language, vad_filter=True, word_timestamps=word_timestamps,
                                 hotwords=self.terms.strip() or None, **options)
                     if gap is not None:
                         segments = transcribe_pair(audio, gap, engine_factory, opts, self.check_stop)
@@ -548,6 +566,7 @@ class TranscriptionJob:
             if self.speaker_timing == "during":
                 self._launch_speaker_diarization(self._speaker_token or self._load_saved_speaker_token())
             options = {"快速": {"beam_size": 5, "batch_size": 2},
+                       "自適應快速": {"beam_size": 1, "batch_size": 2},
                        "極速": {"beam_size": 1, "batch_size": 2},
                        "原始精細": {"beam_size": 5}}[self.mode]
             converter = OpenCC("s2twp")
@@ -556,8 +575,11 @@ class TranscriptionJob:
                 with self.condition:
                     self.chunk_parallel_enabled = self.parallel_enabled
                     parallel_enabled = self.chunk_parallel_enabled
+                    self.chunk_word_timestamps = self.word_timestamps
+                    word_timestamps = self.chunk_word_timestamps
                     self.phase = f"等待運算資源：{timestamp(core_start)} 起的片段"
-                segments_list = self._recognize_chunk(audio, core_start, parallel_enabled, options)
+                segments_list = self._recognize_chunk(audio, core_start, parallel_enabled,
+                                                     word_timestamps, options)
                 for raw_segment in segments_list:
                     segment = owned_segment(raw_segment, offset, core_start, core_end)
                     if segment is None:
@@ -568,7 +590,7 @@ class TranscriptionJob:
                         if text and b > a:
                             self.rows.append((a, b, text))
                             self.words.append([(max(0, w.start), min(duration, w.end), w.word)
-                                               for w in segment.words])
+                                               for w in (segment.words or [])])
                             self.content_revision += 1
                         self.processed = max(self.processed, min(core_end, b))
                         self.condition.notify_all()

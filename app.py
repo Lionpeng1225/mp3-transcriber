@@ -108,13 +108,19 @@ if engine_name == "whisper.cpp":
 size = st.selectbox("辨識模型（Faster Whisper）", ["small", "medium", "large-v3", "turbo"], disabled=active or engine_name == "whisper.cpp")
 st.caption("Turbo 採用精簡解碼器，適合測試速度與品質的平衡；正確率仍需對照錄音。新模型下載至程式的 models 資料夾。")
 language = st.selectbox("錄音語言", ["中文", "自動偵測", "英文"], disabled=active)
-mode = st.selectbox("轉錄模式（Faster Whisper）", ["快速", "極速", "原始精細"], disabled=active or engine_name == "whisper.cpp")
-st.caption("快速模式採用兩段批次辨識，保留原本搜尋範圍。批次處理會增加瞬間記憶體用量。")
+mode = st.selectbox("轉錄模式（Faster Whisper）", ["快速", "自適應快速", "極速", "原始精細"], disabled=active or engine_name == "whisper.cpp")
+if mode == "自適應快速" and engine_name == "faster-whisper":
+    st.caption("先用單一路徑辨識。可能有人聲但結果為空、信心偏低或文字重複的短段，才擴大搜尋重辨一次。")
+elif mode == "快速" and engine_name == "faster-whisper":
+    st.caption("快速模式採用兩段批次辨識，保留原本搜尋範圍。批次處理會增加瞬間記憶體用量。")
 if mode == "極速":
     st.warning("極速模式會縮小搜尋範圍，專有名詞與語句較容易誤辨，請對照錄音校正。")
 terms = st.text_input("專有名詞提示（選填）", disabled=active)
 st.caption("專有名詞會作為辨識熱詞提示，例如 dopamine、多巴胺、前額葉。請只填入錄音相關詞彙，避免錯誤提示影響辨識。")
 initial_parallel = st.checkbox("新工作啟用切分兩段並行轉錄", value=False, disabled=active)
+initial_word_timestamps = st.checkbox(
+    "新工作啟用詞級時間戳（方便精確配對說話者；推論會較慢）",
+    value=True, disabled=active or engine_name == "whisper.cpp")
 speaker_timing = st.selectbox(
     "說話者辨識時機",
     ["手動辨識", "與轉錄同時開始", "每次暫停時開始", "轉錄完成後開始"],
@@ -128,7 +134,8 @@ if st.button("開始轉錄", type="primary", disabled=recording is None or activ
                                mode, terms, backend=backend, parallel_enabled=initial_parallel,
                                speaker_timing={"手動辨識": "manual", "與轉錄同時開始": "during",
                                                "每次暫停時開始": "pause", "轉錄完成後開始": "after"}[speaker_timing],
-                               speaker_token=st.session_state.get("speaker_token_global", ""))
+                               speaker_token=st.session_state.get("speaker_token_global", ""),
+                               word_timestamps=initial_word_timestamps)
         register_job(job)
         st.session_state.job = job
         st.query_params["job"] = job.id
@@ -201,6 +208,22 @@ def job_panel():
                 and state["status"] not in TERMINAL
                 and state["chunk_parallel_enabled"] != parallel_enabled):
             st.info("設定已變更，等待下一個兩分鐘片段套用。")
+        word_key = f"word_timestamps_{job.id}"
+        if word_key not in st.session_state:
+            st.session_state[word_key] = state.get("word_timestamps", True)
+        word_enabled = st.toggle("詞級時間戳與細緻說話者標記", key=word_key,
+                                 disabled=state.get("backend", {}).get("engine") == "whisper.cpp")
+        if word_enabled != state.get("word_timestamps", True):
+            try:
+                job.set_word_timestamps(word_enabled)
+                st.rerun()
+            except (OSError, ValueError) as error:
+                st.error(f"設定保存失敗：{error}")
+        st.caption("可隨時切換，從下一個兩分鐘片段生效；關閉後仍保留逐字稿時間戳，說話者標籤改按整句配對，不能在句中換人處切開。詞級時間戳會增加推論時間。Whisper.cpp 不支援此選項。")
+        if (state.get("chunk_word_timestamps") is not None
+                and state["status"] not in TERMINAL
+                and state["chunk_word_timestamps"] != word_enabled):
+            st.info("設定已變更，下一個兩分鐘片段開始套用。")
     else:
         st.caption("此工作使用更新前的程式；重新啟動並從保存點接續後，即可使用並行開關。")
     if state.get("preparing_model"):
